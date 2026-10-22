@@ -157,15 +157,106 @@ def _finditer_abs(regex, text, slice_start, slice_end):
     Координаты берутся по группе 1, если она есть, иначе по всему матчу.
     """
     result = []
-    for m in regex.finditer(text, slice_start, slice_end):
-        if m.groups():
-            g_start, g_stop = m.start(1), m.end(1)
-            val = m.group(1)
+    for match in regex.finditer(text, slice_start, slice_end):
+        if match.groups():
+            value_start = match.start(1)
+            value_stop = match.end(1)
+            value = match.group(1)
         else:
-            g_start, g_stop = m.start(), m.end()
-            val = m.group(0)
-        result.append({"value": val, "start": g_start, "stop": g_stop})
+            value_start = match.start()
+            value_stop = match.end()
+            value = match.group(0)
+        result.append({"value": value, "start": value_start, "stop": value_stop})
     return result
+
+
+def _select_accounts_by_bank(
+        text,
+        account_matches,
+        window_start,
+        window_end,
+        compiled_owners,
+        compiled_bank_markers,
+):
+    """Оставляет только счета, привязанные к owner-банкам.
+
+    Область поиска (window_start, window_end) — та же, что при поиске всех
+    счетов. Внутри неё:
+
+    1. Находим ВСЕ банки в окне: owner-позиции + ignore-маркеры
+       (TOP_RUSSIAN_BANKS минус owner + account_ignore_patterns).
+    2. Первый банк в окне определяет ГЛОБАЛЬНОЕ направление:
+       - если перед первым банком есть счёт → "account_to_bank";
+       - иначе → "bank_to_account".
+    3. Для каждого owner-банка берём счета в нужную сторону до ближайшего
+       банка-маркера (или до края окна).
+
+    Параметры:
+    ----------
+    text : str — исходный текст целиком.
+    account_matches : list[dict] — счета в окне [{value, start, stop}].
+    window_start, window_end : int — абсолютные границы окна.
+    compiled_owners : list[re.Pattern] — owner-паттерны.
+    compiled_bank_markers : list[re.Pattern] — маркеры всех прочих банков.
+    """
+    if not compiled_owners:
+        return account_matches  # owner не задан — фильтр не применяется
+
+    if not account_matches:
+        return []
+
+    # 1) Owner-банки в окне
+    owner_occurrences = []
+    for owner_regex in compiled_owners:
+        for match in owner_regex.finditer(text, window_start, window_end):
+            owner_occurrences.append({"start": match.start(), "stop": match.end()})
+    owner_occurrences.sort(key=lambda occ: occ["start"])
+
+    # 2) Все банки-маркеры = ignore + owner (owner — тоже банк в тексте)
+    bank_occurrences = []
+    for bank_regex in compiled_bank_markers:
+        for match in bank_regex.finditer(text, window_start, window_end):
+            bank_occurrences.append({"start": match.start(), "stop": match.end()})
+    bank_occurrences.extend(owner_occurrences)
+    bank_occurrences.sort(key=lambda occ: occ["start"])
+
+    if not bank_occurrences:
+        return []  # в окне вообще нет банков — привязывать не к чему
+
+    if not owner_occurrences:
+        return []  # owner-банков в окне нет
+
+    # 3) Глобальное направление по первому банку в окне
+    first_bank = bank_occurrences[0]
+    accounts_before_first_bank = any(
+        acc["start"] < first_bank["start"] for acc in account_matches
+    )
+    direction = "account_to_bank" if accounts_before_first_bank else "bank_to_account"
+
+    # 4) Для каждого owner — счета в нужную сторону до соседнего банка-маркера
+    selected = []
+    seen_keys = set()
+    for owner in owner_occurrences:
+        if direction == "bank_to_account":
+            segment_start = owner["stop"]
+            next_banks = [b for b in bank_occurrences if b["start"] >= owner["stop"]]
+            segment_end = next_banks[0]["start"] if next_banks else window_end
+        else:  # account_to_bank
+            segment_end = owner["start"]
+            prev_banks = [b for b in bank_occurrences if b["stop"] <= owner["start"]]
+            segment_start = prev_banks[-1]["stop"] if prev_banks else window_start
+
+        for acc in account_matches:
+            if acc["start"] < segment_start or acc["stop"] > segment_end:
+                continue
+            key = (acc["value"], acc["start"])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            selected.append(acc)
+
+    selected.sort(key=lambda acc: acc["start"])
+    return selected
 
 
 def extract_entities_with_attributes(
@@ -279,11 +370,12 @@ def extract_entities_with_attributes(
         account_owner_patterns=None,
         # СПИСОК РЕГУЛЯРОК для банков/организаций, которым принадлежат счета.
         # Включает режим "только счета указанных банков":
-        #   - TOP_RUSSIAN_BANKS используется для:
+        #   - TOP_RUSSIAN_BANKS (полный, включая owner) используется для:
         #       1) нахождения первого банка в окне (определение направления);
-        #       2) игнорирования чужих банков (минус owner);
-        #       3) границ "до следующего/предыдущего банка".
-        #   - направление глобальное: определяется по первому банку в окне.
+        #       2) границ "до следующего/предыдущего банка";
+        #   - TOP_RUSSIAN_BANKS минус owner + account_ignore_patterns — для
+        #     игнорирования чужих банков.
+        #   - направление глобальное: по первому банку в окне.
         #       * если перед первым банком есть счёт → "счёт → банк";
         #       * иначе → "банк → счёт".
         #   - для каждого owner-банка берутся счета в нужную сторону
@@ -320,40 +412,69 @@ def extract_entities_with_attributes(
         # Используется, только если задан chunk_size_words.
         # Пример: 50 — соседние куски перекрываются на 50 слов.
 ):
-    if person_labels is None: person_labels = DEFAULT_PERSON_LABELS
-    if org_labels is None: org_labels = DEFAULT_ORG_LABELS
-    if birth_date_markers is None: birth_date_markers = DEFAULT_BIRTH_DATE_MARKERS
+    if person_labels is None:
+        person_labels = DEFAULT_PERSON_LABELS
+    if org_labels is None:
+        org_labels = DEFAULT_ORG_LABELS
+    if birth_date_markers is None:
+        birth_date_markers = DEFAULT_BIRTH_DATE_MARKERS
 
     final_labels = {}
-    if "PER" in entity_types: final_labels.update(person_labels)
-    if "ORG" in entity_types: final_labels.update(org_labels)
+    if "PER" in entity_types:
+        final_labels.update(person_labels)
+    if "ORG" in entity_types:
+        final_labels.update(org_labels)
 
-    compiled_ignore_orgs = [re.compile(p, re.IGNORECASE) for p in (ignore_org_patterns or [])]
-    compiled_ignore_persons = [re.compile(p, re.IGNORECASE) for p in (ignore_person_patterns or [])]
-    compiled_birth_date_markers = [re.compile(p, re.IGNORECASE) for p in birth_date_markers]
+    compiled_ignore_orgs = [re.compile(pattern, re.IGNORECASE) for pattern in (ignore_org_patterns or [])]
+    compiled_ignore_persons = [re.compile(pattern, re.IGNORECASE) for pattern in (ignore_person_patterns or [])]
+    compiled_birth_date_markers = [re.compile(pattern, re.IGNORECASE) for pattern in birth_date_markers]
 
-    compiled_account_owners = [re.compile(p, re.IGNORECASE) for p in (account_owner_patterns or [])]
+    # --- Подготовка фильтрации счетов по банкам ---------------------------------
+    # compiled_account_owners — owner-банки (их счета берём).
+    # compiled_account_ignores — маркеры всех прочих банков (TOP_RUSSIAN_BANKS
+    #   минус owner + явные account_ignore_patterns). Используются в ШАГЕ 4
+    #   как границы сегментов и для игнорирования чужих банков.
+    compiled_account_owners = [
+        re.compile(owner_pattern, re.IGNORECASE)
+        for owner_pattern in (account_owner_patterns or [])
+    ]
 
     ignore_bank_patterns = []
-    for p in TOP_RUSSIAN_BANKS:
+    for bank_pattern in TOP_RUSSIAN_BANKS:
         is_owner = any(
-            re.search(op, p, re.IGNORECASE) or re.search(p, op, re.IGNORECASE)
-            for op in (account_owner_patterns or [])
+            re.search(owner_pattern, bank_pattern, re.IGNORECASE)
+            or re.search(bank_pattern, owner_pattern, re.IGNORECASE)
+            for owner_pattern in (account_owner_patterns or [])
         )
         if not is_owner:
-            ignore_bank_patterns.append(p)
+            ignore_bank_patterns.append(bank_pattern)
+
     if account_ignore_patterns:
         ignore_bank_patterns.extend(account_ignore_patterns)
-    compiled_account_ignores = [re.compile(p, re.IGNORECASE) for p in ignore_bank_patterns]
 
+    compiled_account_ignores = [
+        re.compile(bank_pattern, re.IGNORECASE)
+        for bank_pattern in ignore_bank_patterns
+    ]
+
+    # --- Активные атрибуты ------------------------------------------------------
     active_attributes = {}
     if attributes_to_find:
         if "inn" in attributes_to_find:
-            active_attributes["inn"] = {"regex": re.compile(inn_pattern), "applies_to": {"ORG"}}
+            active_attributes["inn"] = {
+                "regex": re.compile(inn_pattern),
+                "applies_to": {"ORG"},
+            }
         if "birth_date" in attributes_to_find:
-            active_attributes["birth_date"] = {"regex": re.compile(birth_date_pattern), "applies_to": {"PER"}}
+            active_attributes["birth_date"] = {
+                "regex": re.compile(birth_date_pattern),
+                "applies_to": {"PER"},
+            }
         if "account" in attributes_to_find:
-            active_attributes["account"] = {"regex": re.compile(account_pattern), "applies_to": {"PER", "ORG"}}
+            active_attributes["account"] = {
+                "regex": re.compile(account_pattern),
+                "applies_to": {"PER", "ORG"},
+            }
 
     model = get_model()
 
@@ -371,18 +492,18 @@ def extract_entities_with_attributes(
 
             chunk_entities = model.predict_entities(chunk_text, final_labels, threshold=0.1)
 
-            for ent in chunk_entities:
-                ent["start"] += offset
-                ent["end"] += offset
-                all_raw_entities.append(ent)
+            for entity in chunk_entities:
+                entity["start"] += offset
+                entity["end"] += offset
+                all_raw_entities.append(entity)
 
         unique_entities = []
         seen_keys = set()
-        for ent in all_raw_entities:
-            key = (ent["text"], ent["start"] // 10)
+        for entity in all_raw_entities:
+            key = (entity["text"], entity["start"] // 10)
             if key not in seen_keys:
                 seen_keys.add(key)
-                unique_entities.append(ent)
+                unique_entities.append(entity)
         raw_entities = unique_entities
     else:
         raw_entities = model.predict_entities(text, final_labels, threshold=0.1)
@@ -392,9 +513,9 @@ def extract_entities_with_attributes(
     # ========================================================================
     if "PER" in entity_types:
         existing_per_stems = set()
-        for e in raw_entities:
-            if e['label'] == 'PER':
-                words = e['text'].split()
+        for entity in raw_entities:
+            if entity['label'] == 'PER':
+                words = entity['text'].split()
                 if words and len(words[0]) >= 5:
                     existing_per_stems.add(words[0][:5].lower())
 
@@ -418,54 +539,53 @@ def extract_entities_with_attributes(
     # ========================================================================
     # ШАГ 1. СКЛЕЙКА СОСЕДНИХ ORG + ПРИКЛЕИВАНИЕ ОПФ (С ПРОВЕРКОЙ)
     # ========================================================================
-    raw_sorted = sorted(raw_entities, key=lambda e: e["start"])
+    raw_sorted = sorted(raw_entities, key=lambda entity: entity["start"])
 
     merged_entities = []
-    for ent in raw_sorted:
+    for entity in raw_sorted:
         merged_entities.append({
-            'start': ent["start"],
-            'stop': ent["end"],
-            'text': ent["text"],
-            'type': ent["label"],
-            'cluster_key': re.sub(r'[«»"\s]', '', ent["text"].lower())
+            'start': entity["start"],
+            'stop': entity["end"],
+            'text': entity["text"],
+            'type': entity["label"],
+            'cluster_key': re.sub(r'[«»"\s]', '', entity["text"].lower()),
         })
 
-    merged_entities.sort(key=lambda x: x['start'])
+    merged_entities.sort(key=lambda entity: entity['start'])
 
     # 1.1 Склейка соседних ORG
-    i = 1
-    while i < len(merged_entities):
-        cur = merged_entities[i]
-        prev = merged_entities[i - 1]
+    index = 1
+    while index < len(merged_entities):
+        current = merged_entities[index]
+        previous = merged_entities[index - 1]
 
-        if cur['type'] == 'ORG' and prev['type'] == 'ORG':
-            between = text[prev['stop']:cur['start']]
+        if current['type'] == 'ORG' and previous['type'] == 'ORG':
+            between = text[previous['stop']:current['start']]
             if re.fullmatch(r'[\s«»"\-–—]*', between):
-                if prev['text'].upper() in ORG_FORMS:
-                    cur['text'] = f"{prev['text']} {cur['text']}"
-                    cur['start'] = prev['start']
-                    cur['cluster_key'] = re.sub(r'[«»"\s]', '', cur['text'].lower())
-                    merged_entities.pop(i - 1)
-                    i -= 1
+                if previous['text'].upper() in ORG_FORMS:
+                    current['text'] = f"{previous['text']} {current['text']}"
+                    current['start'] = previous['start']
+                    current['cluster_key'] = re.sub(r'[«»"\s]', '', current['text'].lower())
+                    merged_entities.pop(index - 1)
+                    index -= 1
                     continue
                 else:
-                    prev['text'] = f"{prev['text']} {cur['text']}"
-                    prev['stop'] = cur['stop']
-                    prev['cluster_key'] = re.sub(r'[«»"\s]', '', prev['text'].lower())
-                    merged_entities.pop(i)
+                    previous['text'] = f"{previous['text']} {current['text']}"
+                    previous['stop'] = current['stop']
+                    previous['cluster_key'] = re.sub(r'[«»"\s]', '', previous['text'].lower())
+                    merged_entities.pop(index)
                     continue
-        i += 1
+        index += 1
 
     # 1.2 Приклеивание ОПФ СЛЕВА (с проверкой, нет ли уже ОПФ)
     sorted_forms = sorted(ORG_FORMS, key=len, reverse=True)
-    opf_pattern = r'\b(' + '|'.join(re.escape(f) for f in sorted_forms) + r')\b'
+    opf_pattern = r'\b(' + '|'.join(re.escape(form) for form in sorted_forms) + r')\b'
 
-    for ent in merged_entities:
-        if ent['type'] != 'ORG':
+    for entity in merged_entities:
+        if entity['type'] != 'ORG':
             continue
 
-        # Проверяем, начинается ли название уже с ОПФ
-        words = ent['text'].split()
+        words = entity['text'].split()
         already_has_opf = False
         if words:
             first_word = words[0].upper()
@@ -479,44 +599,43 @@ def extract_entities_with_attributes(
         if already_has_opf:
             continue
 
-        # Ищем ОПФ в 100 символах слева
-        left_start = max(0, ent['start'] - 100)
-        left_text = text[left_start:ent['start']]
+        left_start = max(0, entity['start'] - 100)
+        left_text = text[left_start:entity['start']]
 
         matches = list(re.finditer(opf_pattern, left_text, re.IGNORECASE))
         if matches:
-            match = matches[-1]  # Берем ближайшее
+            match = matches[-1]
             opf = match.group(1).upper()
-            ent['text'] = f"{opf} {ent['text']}"
-            ent['start'] = left_start + match.start()
-            ent['cluster_key'] = re.sub(r'[«»"\s]', '', ent['text'].lower())
+            entity['text'] = f"{opf} {entity['text']}"
+            entity['start'] = left_start + match.start()
+            entity['cluster_key'] = re.sub(r'[«»"\s]', '', entity['text'].lower())
 
     # ========================================================================
     # ШАГ 2. ФИЛЬТРАЦИЯ
     # ========================================================================
     filtered_entities = []
-    for ent in merged_entities:
-        ent_text = ent["text"]
-        ent_type = ent["type"]
+    for entity in merged_entities:
+        entity_text = entity["text"]
+        entity_type = entity["type"]
 
-        if ent_type == "ORG":
-            if any(p.search(ent_text) for p in compiled_ignore_orgs):
+        if entity_type == "ORG":
+            if any(pattern.search(entity_text) for pattern in compiled_ignore_orgs):
                 continue
 
-        if ent_type == "PER":
-            ctx_start = max(0, ent["start"] - 50)
-            ctx_text = text[ctx_start:ent["start"]]
-            if any(p.search(ctx_text) for p in compiled_ignore_persons):
+        if entity_type == "PER":
+            context_start = max(0, entity["start"] - 50)
+            context_text = text[context_start:entity["start"]]
+            if any(pattern.search(context_text) for pattern in compiled_ignore_persons):
                 continue
-            if ignore_initials and re.search(r'[А-ЯЁA-Z]\.[А-ЯЁA-Z]?\.?', ent_text):
+            if ignore_initials and re.search(r'[А-ЯЁA-Z]\.[А-ЯЁA-Z]?\.?', entity_text):
                 continue
 
-        if ent_type == "ORG" and ent_text.upper() in ORG_FORMS:
+        if entity_type == "ORG" and entity_text.upper() in ORG_FORMS:
             continue
 
-        filtered_entities.append(ent)
+        filtered_entities.append(entity)
 
-    filtered_entities.sort(key=lambda x: x['start'])
+    filtered_entities.sort(key=lambda entity: entity['start'])
 
     # ========================================================================
     # ШАГ 3. КЛАСТЕРИЗАЦИЯ
@@ -525,27 +644,32 @@ def extract_entities_with_attributes(
     for span in filtered_entities:
         if span['type'] == 'PER':
             words = span['text'].split()
-            key_parts = [w[:3].lower() for w in words[:3]]
+            key_parts = [word[:3].lower() for word in words[:3]]
             key = "".join(key_parts)
         else:
             key = span['cluster_key']
 
         if key not in clusters:
-            clusters[key] = {'start': span['start'], 'stop': span['stop'], 'text': span['text'], 'type': span['type']}
+            clusters[key] = {
+                'start': span['start'],
+                'stop': span['stop'],
+                'text': span['text'],
+                'type': span['type'],
+            }
         else:
             clusters[key]['stop'] = max(clusters[key]['stop'], span['stop'])
 
     merged_spans = list(clusters.values())
-    merged_spans.sort(key=lambda x: x['start'])
+    merged_spans.sort(key=lambda span: span['start'])
 
     if not active_attributes:
         return [{
-            'entity': s['text'],
-            'type': s['type'],
-            'start': s['start'],
-            'stop': s['stop'],
+            'entity': span['text'],
+            'type': span['type'],
+            'start': span['start'],
+            'stop': span['stop'],
             'attributes': {},
-        } for s in merged_spans]
+        } for span in merged_spans]
 
     # ========================================================================
     # ШАГ 4. ПОИСК АТРИБУТОВ (абсолютные координаты по входному тексту)
@@ -553,77 +677,83 @@ def extract_entities_with_attributes(
     results = []
     used_accounts = set()
 
-    for i, span in enumerate(merged_spans):
+    for span_index, span in enumerate(merged_spans):
         entity_text = span['text']
         entity_type = span['type']
 
-        block_end = len(text) if i + 1 == len(merged_spans) else merged_spans[i + 1]['start']
-        block_start = 0 if i == 0 else merged_spans[i - 1]['stop']
+        block_end = len(text) if span_index + 1 == len(merged_spans) else merged_spans[span_index + 1]['start']
+        block_start = 0 if span_index == 0 else merged_spans[span_index - 1]['stop']
 
         search_start = max(block_start, span['start'] - 300)
         search_end = block_end
 
         found_attributes = {}
 
-        for attr_name, attr_info in active_attributes.items():
-            if entity_type not in attr_info["applies_to"]:
-                found_attributes[attr_name] = None if attr_name != "account" else []
+        for attribute_name, attribute_info in active_attributes.items():
+            if entity_type not in attribute_info["applies_to"]:
+                found_attributes[attribute_name] = None if attribute_name != "account" else []
                 continue
 
-            regex = attr_info["regex"]
+            regex = attribute_info["regex"]
 
-            # ---------------------------------------------------------------
-            # birth_date / inn — одно значение (первое найденное по приоритету)
-            # account — список
-            # ---------------------------------------------------------------
-            if attr_name == "birth_date":
+            if attribute_name == "birth_date":
                 chosen = None
 
-                # 1) дата внутри сущности с явным маркером
                 inside = _finditer_abs(regex, text, span['start'], span['stop'])
                 explicit_inside = []
                 for item in inside:
-                    before_ctx = text[max(0, item["start"] - 30):item["start"]]
-                    if any(p.search(before_ctx) for p in compiled_birth_date_markers):
+                    before_context = text[max(0, item["start"] - 30):item["start"]]
+                    if any(pattern.search(before_context) for pattern in compiled_birth_date_markers):
                         explicit_inside.append(item)
                 if explicit_inside:
                     chosen = explicit_inside[0]
                 elif inside:
                     chosen = inside[0]
                 else:
-                    # 2) дата после сущности с явным маркером
                     after = _finditer_abs(regex, text, span['stop'], search_end)
                     explicit_after = []
                     for item in after:
-                        before_ctx = text[max(0, item["start"] - 30):item["start"]]
-                        if any(p.search(before_ctx) for p in compiled_birth_date_markers):
+                        before_context = text[max(0, item["start"] - 30):item["start"]]
+                        if any(pattern.search(before_context) for pattern in compiled_birth_date_markers):
                             explicit_after.append(item)
                     if explicit_after:
                         chosen = explicit_after[0]
                     elif after:
                         chosen = after[0]
                     else:
-                        # 3) дата до сущности (последняя)
                         before = _finditer_abs(regex, text, search_start, span['start'])
                         if before:
                             chosen = before[-1]
 
-                found_attributes[attr_name] = chosen  # dict | None
+                found_attributes[attribute_name] = chosen
 
-            elif attr_name == "inn":
+            elif attribute_name == "inn":
                 matches = _finditer_abs(regex, text, search_start, search_end)
-                found_attributes[attr_name] = matches[0] if matches else None
+                found_attributes[attribute_name] = matches[0] if matches else None
 
-            elif attr_name == "account":
+            elif attribute_name == "account":
+                # Область поиска — та же, что при поиске всех счетов
                 matches = _finditer_abs(regex, text, search_start, search_end)
-                uniq = []
+
+                # Фильтрация по банку — только если заданы owner/ignore
+                if compiled_account_owners or compiled_account_ignores:
+                    matches = _select_accounts_by_bank(
+                        text=text,
+                        account_matches=matches,
+                        window_start=search_start,
+                        window_end=search_end,
+                        compiled_owners=compiled_account_owners,
+                        compiled_bank_markers=compiled_account_ignores,
+                    )
+
+                unique_accounts = []
                 for item in matches:
                     key = (item["value"], item["start"])
                     if key in used_accounts:
                         continue
                     used_accounts.add(key)
-                    uniq.append(item)
-                found_attributes[attr_name] = uniq
+                    unique_accounts.append(item)
+                found_attributes[attribute_name] = unique_accounts
 
         results.append({
             'entity': entity_text,
