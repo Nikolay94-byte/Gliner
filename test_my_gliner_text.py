@@ -23,7 +23,7 @@ IGNORE_ORG_PATTERNS = [
     r'втб', r'сбербанк', r'альфа-?банк', r'тбанк|т-банк|тинькофф',
     r'озон\s*банк', r'единая\s+касса', r'банк', r'касса', r'фонд',
     r'мвд', r'омвд', r'отдел', r'отделение', r'суд', r'прокуратур',
-    r'райффайзенбанк',
+    r'райффайзенбанк',r'област(и|ь)',r'РФ',r'Российской Федерации',r'налоговых органов',r'органов\W{,3}контроля'
 ]
 
 IGNORE_PERSON_PATTERNS = [
@@ -59,11 +59,11 @@ def main():
 
         entities = extract_entities_text(
             text,
-            entity_types=("PER", "ORG", "DATE", "PII", "INN", "ACCOUNT", "LOCATION", "BANK"),
+            entity_types=("PERSON", "ORGANIZATION"),   # ← исправлено
             ignore_org_patterns=IGNORE_ORG_PATTERNS,
             ignore_person_patterns=IGNORE_PERSON_PATTERNS,
             ignore_initials=True,
-            return_window=False,
+            return_window=True,
         )
 
         pretty_print(entities)
