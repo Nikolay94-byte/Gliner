@@ -167,17 +167,48 @@ def _attr_values(found, name):
 
 
 # ============================================================================
-# ДИАГНОСТИКА ЭТАПОВ (ЗАПРОШЕНА)
+# ДИАГНОСТИКА ЭТАПОВ (адаптирована под GLiNER 2.5)
 # ============================================================================
 def stages_diagnostics(text, threshold=0.1):
+    # Метки в формате GLiNER 2.5: {label: [описания]}
     final_labels = {}
-    final_labels.update(DEFAULT_PERSON_LABELS)
-    final_labels.update(DEFAULT_ORG_LABELS)
+    for label, desc in DEFAULT_PERSON_LABELS.items():
+        final_labels[label] = [desc] if isinstance(desc, str) else desc
+    for label, desc in DEFAULT_ORG_LABELS.items():
+        final_labels[label] = [desc] if isinstance(desc, str) else desc
 
     model = get_model()
-    raw = model.predict_entities(text, final_labels, threshold=threshold)
+    result = model.extract_entities(
+        text,
+        final_labels,
+        threshold=threshold,
+        include_spans=True,
+        include_confidence=True,
+    )
 
-    print(f"\n  ── ЭТАП 1. СЫРЫЕ СУЩНОСТИ GLiNER (threshold={threshold}), всего {len(raw)}:")
+    # Приводим ответ GLiNER 2.5 к формату диагностики
+    raw = []
+    if isinstance(result, dict) and 'entities' in result:
+        for label, items in result['entities'].items():
+            for item in items:
+                raw.append({
+                    "start": item["start"],
+                    "end": item["end"],
+                    "text": item["text"],
+                    "label": label,
+                    "score": item.get("confidence"),
+                })
+    else:
+        for ent in result:
+            raw.append({
+                "start": ent["start"],
+                "end": ent.get("end", ent.get("stop")),
+                "text": ent["text"],
+                "label": ent.get("label", ent.get("type")),
+                "score": ent.get("confidence"),
+            })
+
+    print(f"\n  ── ЭТАП 1. СЫРЫЕ СУЩНОСТИ GLiNER 2.5 (threshold={threshold}), всего {len(raw)}:")
     for e in raw:
         score = e.get("score")
         score_str = f" score={score:.4f}" if isinstance(score, (int, float)) else ""
@@ -197,7 +228,7 @@ def stages_diagnostics(text, threshold=0.1):
     while i < len(merged) - 1:
         a = merged[i]
         b = merged[i + 1]
-        if a['type'] == 'ORG' and b['type'] == 'ORG':
+        if a['type'] == 'ORGANIZATION' and b['type'] == 'ORGANIZATION':
             between = text[a['stop']:b['start']]
             if re.fullmatch(r'[\s«»"\-–—]*', between):
                 a['text'] = f"{a['text']} {b['text']}"
@@ -213,7 +244,7 @@ def stages_diagnostics(text, threshold=0.1):
     sorted_forms = sorted(ORG_FORMS, key=len, reverse=True)
     opf_pattern = r'\b(' + '|'.join(re.escape(f) for f in sorted_forms) + r')\b'
     for ent in merged:
-        if ent['type'] != 'ORG':
+        if ent['type'] != 'ORGANIZATION':
             continue
         if ent['text'].upper() in ORG_FORMS:
             continue
@@ -237,11 +268,11 @@ def stages_diagnostics(text, threshold=0.1):
         ent_text = ent["text"]
         ent_type = ent["type"]
 
-        if ent_type == "ORG":
+        if ent_type == "ORGANIZATION":
             if any(p.search(ent_text) for p in compiled_ignore_orgs):
                 print(f"      [отсеяна ORG] '{ent_text}' — совпал ignore_org_patterns")
                 continue
-        if ent_type == "PER":
+        if ent_type == "PERSON":
             ctx_start = max(0, ent["start"] - 50)
             ctx_text = text[ctx_start:ent["start"]]
             if any(p.search(ctx_text) for p in compiled_ignore_persons):
@@ -251,7 +282,7 @@ def stages_diagnostics(text, threshold=0.1):
                 print(f"      [отсеяна PER] '{ent_text}' — инициалы")
                 continue
 
-        if ent_type == "ORG" and ent_text.upper() in ORG_FORMS:
+        if ent_type == "ORGANIZATION" and ent_text.upper() in ORG_FORMS:
             print(f"      [отсеяна ORG] '{ent_text}' — голое ОПФ")
             continue
 
@@ -263,7 +294,7 @@ def stages_diagnostics(text, threshold=0.1):
 
     clusters = {}
     for span in filtered:
-        if span['type'] == 'PER':
+        if span['type'] == 'PERSON':
             words = span['text'].split()
             key_parts = [w[:3].lower() for w in words[:3]]
             key = "".join(key_parts)

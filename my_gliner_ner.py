@@ -1,10 +1,10 @@
 import re
-from gliner import GLiNER
+from gliner2 import AutoExtractor
 
 # ============================================================================
 # КОНСТАНТЫ
 # ============================================================================
-MODEL_PATH = r"F:\Python projects\Gliner\models\gliner-relex-base-v1.0"
+MODEL_PATH = r"F:\Python projects\Gliner\models\gliner2.5-multi-v1"
 
 DEFAULT_INN_REGEX = r'\b(\d{10,12})\b'
 DEFAULT_BIRTH_DATE_REGEX = r'\b(\d{2}\.\d{2}\.\d{4})\b'
@@ -12,10 +12,15 @@ DEFAULT_ACCOUNT_REGEX = r'\b(\d{19,20})\b'
 
 DEFAULT_BIRTH_DATE_MARKERS = [r'года\s+рождения', r'г\.р\.', r'родил']
 
-DEFAULT_PERSON_LABELS = {"PER": "A person's full name (ФИО человека, должник, Иванов Иван Иванович)"}
-DEFAULT_ORG_LABELS = {"ORG": "A company, legal entity, or organization name (ООО, АО, ПАО, ИП)"}
+# Метки для GLiNER 2.5 (zero-shot описания)
+DEFAULT_PERSON_LABELS = {
+    "PERSON": "A full name of a person (ФИО человека, Иванов Иван Иванович, Петрова Мария Сергеевна)"
+}
+DEFAULT_ORG_LABELS = {
+    "ORGANIZATION": "A commercial company name INCLUDING its legal form (ООО «АЛЬФАСТРОЙ», АО «Фрязинский Завод», ПАО Сбербанк)"
+}
 
-# Регулярка для подстраховки ФИО (Фамилия Имя Отчество с падежными окончаниями отчества)
+# Регулярка для подстраховки ФИО
 FIO_FALLBACK_REGEX = r'\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+(?:вич|вича|вичу|вичем|виче|вна|вны|вне|вну|вной|ична|ичны|ичне|ичну|ичной|инична|иничны|иничне|иничну|иничной|кызы|улы|оглы)\b'
 
 ORG_FORMS = {
@@ -126,8 +131,8 @@ _model = None
 def get_model():
     global _model
     if _model is None:
-        print(f"[GLiNER] Загрузка модели...")
-        _model = GLiNER.from_pretrained(MODEL_PATH, local_files_only=True)
+        print(f"[GLiNER 2.5] Загрузка модели...")
+        _model = AutoExtractor.from_pretrained(MODEL_PATH, local_files_only=True)
     return _model
 
 
@@ -152,10 +157,7 @@ def split_text_into_chunks(text, chunk_size, overlap):
 
 
 def _finditer_abs(regex, text, slice_start, slice_end):
-    """Ищет regex в text[slice_start:slice_end], возвращает список dict с абсолютными координатами.
-
-    Координаты берутся по группе 1, если она есть, иначе по всему матчу.
-    """
+    """Ищет regex в text[slice_start:slice_end], возвращает список dict с абсолютными координатами."""
     result = []
     for match in regex.finditer(text, slice_start, slice_end):
         if match.groups():
@@ -178,41 +180,18 @@ def _select_accounts_by_bank(
         compiled_owners,
         compiled_bank_markers,
 ):
-    """Оставляет только счета, привязанные к owner-банкам.
-
-    Область поиска (window_start, window_end) — та же, что при поиске всех
-    счетов. Внутри неё:
-
-    1. Находим ВСЕ банки в окне: owner-позиции + ignore-маркеры
-       (TOP_RUSSIAN_BANKS минус owner + account_ignore_patterns).
-    2. Первый банк в окне определяет ГЛОБАЛЬНОЕ направление:
-       - если перед первым банком есть счёт → "account_to_bank";
-       - иначе → "bank_to_account".
-    3. Для каждого owner-банка берём счета в нужную сторону до ближайшего
-       банка-маркера (или до края окна).
-
-    Параметры:
-    ----------
-    text : str — исходный текст целиком.
-    account_matches : list[dict] — счета в окне [{value, start, stop}].
-    window_start, window_end : int — абсолютные границы окна.
-    compiled_owners : list[re.Pattern] — owner-паттерны.
-    compiled_bank_markers : list[re.Pattern] — маркеры всех прочих банков.
-    """
+    """Оставляет только счета, привязанные к owner-банкам (логика не менялась)."""
     if not compiled_owners:
-        return account_matches  # owner не задан — фильтр не применяется
-
+        return account_matches
     if not account_matches:
         return []
 
-    # 1) Owner-банки в окне
     owner_occurrences = []
     for owner_regex in compiled_owners:
         for match in owner_regex.finditer(text, window_start, window_end):
             owner_occurrences.append({"start": match.start(), "stop": match.end()})
     owner_occurrences.sort(key=lambda occ: occ["start"])
 
-    # 2) Все банки-маркеры = ignore + owner (owner — тоже банк в тексте)
     bank_occurrences = []
     for bank_regex in compiled_bank_markers:
         for match in bank_regex.finditer(text, window_start, window_end):
@@ -221,19 +200,16 @@ def _select_accounts_by_bank(
     bank_occurrences.sort(key=lambda occ: occ["start"])
 
     if not bank_occurrences:
-        return []  # в окне вообще нет банков — привязывать не к чему
-
+        return []
     if not owner_occurrences:
-        return []  # owner-банков в окне нет
+        return []
 
-    # 3) Глобальное направление по первому банку в окне
     first_bank = bank_occurrences[0]
     accounts_before_first_bank = any(
         acc["start"] < first_bank["start"] for acc in account_matches
     )
     direction = "account_to_bank" if accounts_before_first_bank else "bank_to_account"
 
-    # 4) Для каждого owner — счета в нужную сторону до соседнего банка-маркера
     selected = []
     seen_keys = set()
     for owner in owner_occurrences:
@@ -241,7 +217,7 @@ def _select_accounts_by_bank(
             segment_start = owner["stop"]
             next_banks = [b for b in bank_occurrences if b["start"] >= owner["stop"]]
             segment_end = next_banks[0]["start"] if next_banks else window_end
-        else:  # account_to_bank
+        else:
             segment_end = owner["start"]
             prev_banks = [b for b in bank_occurrences if b["stop"] <= owner["start"]]
             segment_start = prev_banks[-1]["stop"] if prev_banks else window_start
@@ -259,6 +235,42 @@ def _select_accounts_by_bank(
     return selected
 
 
+def _predict_entities_gliner25(text, final_labels, threshold=0.1):
+    """Обёртка над GLiNER 2.5: возвращает список {start, end, text, label}.
+
+    Приводит формат GLiNER 2.5 к тому, что ожидает остальной код:
+    'end' вместо 'stop', 'label' вместо 'type'.
+    """
+    model = get_model()
+    result = model.extract_entities(
+        text,
+        final_labels,
+        threshold=threshold,
+        include_spans=True,
+        include_confidence=True,
+    )
+
+    entities = []
+    if isinstance(result, dict) and 'entities' in result:
+        for label, items in result['entities'].items():
+            for item in items:
+                entities.append({
+                    "start": item["start"],
+                    "end": item["end"],
+                    "text": item["text"],
+                    "label": label,
+                })
+    else:
+        for ent in result:
+            entities.append({
+                "start": ent["start"],
+                "end": ent.get("end", ent.get("stop")),
+                "text": ent["text"],
+                "label": ent.get("label", ent.get("type")),
+            })
+    return entities
+
+
 def extract_entities_with_attributes(
         text,
 
@@ -266,151 +278,45 @@ def extract_entities_with_attributes(
         # 1. ЧТО ИСКАТЬ
         # ====================================================================
         entity_types=("PER", "ORG"),
-        # Типы сущностей для поиска.
-        # "PER" — люди (ФИО), "ORG" — организации.
-        # Пример: ("PER",) — искать только людей.
 
         person_labels=None,
-        # Описание для GLiNER, как искать людей.
-        # Если None, используется DEFAULT_PERSON_LABELS.
-        # Пример: {"PER": "ФИО должника, гражданин РФ"}
-
         org_labels=None,
-        # Описание для GLiNER, как искать организации.
-        # Если None, используется DEFAULT_ORG_LABELS.
-        # Пример: {"ORG": "Коммерческая организация, ООО, АО"}
-
 
         # ====================================================================
         # 2. ФИЛЬТРЫ ДЛЯ ОРГАНИЗАЦИЙ
         # ====================================================================
         ignore_org_patterns=None,
-        # СПИСОК РЕГУЛЯРОК для отсева организаций.
-        # ВАЖНО: проверяется ТОЛЬКО текст самой сущности (после склейки
-        # соседних ORG и приклеивания ОПФ). Контекст перед сущностью для
-        # ORG НЕ проверяется — иначе слова "банк", "фонд" и т.п. из
-        # предыдущего предложения отсеивали бы нормальные организации.
-        #
-        # Заполнение (пример):
-        #   [
-        #       r'банк', r'сбербанк', r'втб',  # Отсев банков
-        #       r'мвд', r'омвд', r'отдел',     # Отсев госорганов
-        #       r'суд', r'прокуратур'          # Отсев судов
-        #   ]
-        #
-        # Если None или пустой список — фильтрация не применяется.
 
         # ====================================================================
         # 3. ФИЛЬТРЫ ДЛЯ ФИО
         # ====================================================================
         ignore_person_patterns=None,
-        # СПИСОК РЕГУЛЯРОК для отсева ФИО по КОНТЕКСТУ (50 символов перед именем).
-        # Для ФИО контекст важен: "судья", "следователь", "прокурор",
-        # "в интересах" и т.п. стоят ПЕРЕД именем, а не входят в него.
-        #
-        # Заполнение (пример):
-        #   [
-        #       r'судья', r'следовател', r'дознавател',
-        #       r'прокурор', r'в интересах'
-        #   ]
-        #
-        # Если None или пустой список — фильтрация не применяется.
-
         ignore_initials=True,
-        # Флаг: игнорировать ли ФИО с инициалами.
-        # True — "И.С. Иванов" будет отсеян (по умолчанию).
-        # False — инициалы разрешены.
 
         # ====================================================================
         # 4. РЕГУЛЯРКИ ДЛЯ АТРИБУТОВ
         # ====================================================================
         inn_pattern=DEFAULT_INN_REGEX,
-        # Регулярка для поиска ИНН.
-        # По умолчанию: r'\b(\d{10,12})\b' (10 или 12 цифр).
-        # Можно переопределить, например: r'\b(\d{10})\b' (только 10 цифр).
-
         birth_date_pattern=DEFAULT_BIRTH_DATE_REGEX,
-        # Регулярка для поиска ДАТЫ РОЖДЕНИЯ.
-        # По умолчанию: r'\b(\d{2}\.\d{2}\.\d{4})\b' (ДД.ММ.ГГГГ).
-        # Можно переопределить, например: r'\b(\d{2}/\d{2}/\d{4})\b'.
-
         account_pattern=DEFAULT_ACCOUNT_REGEX,
-        # Регулярка для поиска СЧЕТОВ.
-        # По умолчанию: r'\b(\d{19,20})\b' (19 или 20 цифр).
-        # Можно переопределить, например: r'\b(\d{20})\b' (только 20 цифр).
-
         birth_date_markers=None,
-        # СПИСОК РЕГУЛЯРОК для маркеров даты рождения.
-        # Используется, чтобы отличить дату рождения от других дат (например, срока ареста).
-        #
-        # Заполнение (пример):
-        #   [
-        #       r'года\s+рождения',
-        #       r'г\.р\.',
-        #       r'родил'
-        #   ]
-        #
-        # Если None, используются DEFAULT_BIRTH_DATE_MARKERS.
 
         # ====================================================================
         # 5. КАКИЕ АТРИБУТЫ ИСКАТЬ
         # ====================================================================
         attributes_to_find=("inn", "birth_date", "account"),
-        # Кортеж атрибутов для поиска.
-        #
-        # Заполнение:
-        #   - () — искать ТОЛЬКО сущности, без атрибутов.
-        #   - ("account",) — искать только счета.
-        #   - ("inn", "account") — искать ИНН и счета.
-        #   - ("inn", "birth_date", "account") — искать всё (по умолчанию).
 
         # ====================================================================
         # 6. ФИЛЬТРАЦИЯ СЧЕТОВ ПО БАНКУ/ВЛАДЕЛЬЦУ
         # ====================================================================
         account_owner_patterns=None,
-        # СПИСОК РЕГУЛЯРОК для банков/организаций, которым принадлежат счета.
-        # Включает режим "только счета указанных банков":
-        #   - TOP_RUSSIAN_BANKS (полный, включая owner) используется для:
-        #       1) нахождения первого банка в окне (определение направления);
-        #       2) границ "до следующего/предыдущего банка";
-        #   - TOP_RUSSIAN_BANKS минус owner + account_ignore_patterns — для
-        #     игнорирования чужих банков.
-        #   - направление глобальное: по первому банку в окне.
-        #       * если перед первым банком есть счёт → "счёт → банк";
-        #       * иначе → "банк → счёт".
-        #   - для каждого owner-банка берутся счета в нужную сторону
-        #     до следующего/предыдущего банка (или до края окна).
-        #
-        # Пример:
-        #   [r'ВТБ', r'Банк ВТБ', r'ПАО ВТБ']
-        #
-        # Если None или пустой список (и account_ignore_patterns тоже пуст) —
-        # фильтрация по банку не применяется: привязываются ВСЕ найденные счета.
-
         account_ignore_patterns=None,
-        # СПИСОК РЕГУЛЯРОК для банков/организаций, счета которых НУЖНО ИГНОРИРОВАТЬ.
-        # Работает вместе с account_owner_patterns:
-        #   - итоговый ignore = TOP_RUSSIAN_BANKS минус owner + account_ignore_patterns.
-        #   - если owner-банк стоит до счёта, а между ними ignored-банк — счёт не берётся.
-        #
-        # Пример:
-        #   [r'Сбербанк', r'Сбер', r'Тинькофф', r'Альфа-Банк']
-        #
-        # Если None или пустой список — дополнительных игнорируемых банков нет
-        # (используется только TOP_RUSSIAN_BANKS минус owner).
 
         # ====================================================================
-        # 7. ЧАНКИНГ (РАЗБИВКА ДЛИННОГО ТЕКСТА)
+        # 7. ЧАНКИНГ
         # ====================================================================
         chunk_size_words=None,
-        # Размер куска в словах.
-        # Если None (по умолчанию) — текст не делится на чанки и подается в модель целиком.
-        # Пример: 300 — разбить текст на куски по 300 слов.
-
         chunk_overlap_words=None
-        # Перекрытие между кусками в словах.
-        # Используется, только если задан chunk_size_words.
-        # Пример: 50 — соседние куски перекрываются на 50 слов.
 ):
     if person_labels is None:
         person_labels = DEFAULT_PERSON_LABELS
@@ -419,21 +325,19 @@ def extract_entities_with_attributes(
     if birth_date_markers is None:
         birth_date_markers = DEFAULT_BIRTH_DATE_MARKERS
 
+    # Собираем метки в формате GLiNER 2.5: dict {label: [описания]}
     final_labels = {}
     if "PER" in entity_types:
-        final_labels.update(person_labels)
+        for label, desc in person_labels.items():
+            final_labels[label] = [desc] if isinstance(desc, str) else desc
     if "ORG" in entity_types:
-        final_labels.update(org_labels)
+        for label, desc in org_labels.items():
+            final_labels[label] = [desc] if isinstance(desc, str) else desc
 
     compiled_ignore_orgs = [re.compile(pattern, re.IGNORECASE) for pattern in (ignore_org_patterns or [])]
     compiled_ignore_persons = [re.compile(pattern, re.IGNORECASE) for pattern in (ignore_person_patterns or [])]
     compiled_birth_date_markers = [re.compile(pattern, re.IGNORECASE) for pattern in birth_date_markers]
 
-    # --- Подготовка фильтрации счетов по банкам ---------------------------------
-    # compiled_account_owners — owner-банки (их счета берём).
-    # compiled_account_ignores — маркеры всех прочих банков (TOP_RUSSIAN_BANKS
-    #   минус owner + явные account_ignore_patterns). Используются в ШАГЕ 4
-    #   как границы сегментов и для игнорирования чужих банков.
     compiled_account_owners = [
         re.compile(owner_pattern, re.IGNORECASE)
         for owner_pattern in (account_owner_patterns or [])
@@ -457,7 +361,6 @@ def extract_entities_with_attributes(
         for bank_pattern in ignore_bank_patterns
     ]
 
-    # --- Активные атрибуты ------------------------------------------------------
     active_attributes = {}
     if attributes_to_find:
         if "inn" in attributes_to_find:
@@ -476,10 +379,8 @@ def extract_entities_with_attributes(
                 "applies_to": {"PER", "ORG"},
             }
 
-    model = get_model()
-
     # ========================================================================
-    # ЧАНКИНГ И ПОИСК СУЩНОСТЕЙ
+    # ЧАНКИНГ И ПОИСК СУЩНОСТЕЙ (GLiNER 2.5)
     # ========================================================================
     if chunk_size_words is not None:
         overlap = chunk_overlap_words or 0
@@ -490,7 +391,7 @@ def extract_entities_with_attributes(
             chunk_text = chunk["text"]
             offset = chunk["char_start"]
 
-            chunk_entities = model.predict_entities(chunk_text, final_labels, threshold=0.1)
+            chunk_entities = _predict_entities_gliner25(chunk_text, final_labels, threshold=0.1)
 
             for entity in chunk_entities:
                 entity["start"] += offset
@@ -506,7 +407,7 @@ def extract_entities_with_attributes(
                 unique_entities.append(entity)
         raw_entities = unique_entities
     else:
-        raw_entities = model.predict_entities(text, final_labels, threshold=0.1)
+        raw_entities = _predict_entities_gliner25(text, final_labels, threshold=0.1)
 
     # ========================================================================
     # ПОДСТРАХОВКА (FALLBACK) ДЛЯ ФИО
@@ -514,7 +415,7 @@ def extract_entities_with_attributes(
     if "PER" in entity_types:
         existing_per_stems = set()
         for entity in raw_entities:
-            if entity['label'] == 'PER':
+            if entity['label'] == 'PERSON':
                 words = entity['text'].split()
                 if words and len(words[0]) >= 5:
                     existing_per_stems.add(words[0][:5].lower())
@@ -533,11 +434,11 @@ def extract_entities_with_attributes(
                 "start": match.start(),
                 "end": match.end(),
                 "text": fallback_text,
-                "label": "PER",
+                "label": "PERSON",
             })
 
     # ========================================================================
-    # ШАГ 1. СКЛЕЙКА СОСЕДНИХ ORG + ПРИКЛЕИВАНИЕ ОПФ (С ПРОВЕРКОЙ)
+    # ШАГ 1. СКЛЕЙКА СОСЕДНИХ ORG + ПРИКЛЕИВАНИЕ ОПФ
     # ========================================================================
     raw_sorted = sorted(raw_entities, key=lambda entity: entity["start"])
 
@@ -553,13 +454,12 @@ def extract_entities_with_attributes(
 
     merged_entities.sort(key=lambda entity: entity['start'])
 
-    # 1.1 Склейка соседних ORG
     index = 1
     while index < len(merged_entities):
         current = merged_entities[index]
         previous = merged_entities[index - 1]
 
-        if current['type'] == 'ORG' and previous['type'] == 'ORG':
+        if current['type'] == 'ORGANIZATION' and previous['type'] == 'ORGANIZATION':
             between = text[previous['stop']:current['start']]
             if re.fullmatch(r'[\s«»"\-–—]*', between):
                 if previous['text'].upper() in ORG_FORMS:
@@ -577,12 +477,11 @@ def extract_entities_with_attributes(
                     continue
         index += 1
 
-    # 1.2 Приклеивание ОПФ СЛЕВА (с проверкой, нет ли уже ОПФ)
     sorted_forms = sorted(ORG_FORMS, key=len, reverse=True)
     opf_pattern = r'\b(' + '|'.join(re.escape(form) for form in sorted_forms) + r')\b'
 
     for entity in merged_entities:
-        if entity['type'] != 'ORG':
+        if entity['type'] != 'ORGANIZATION':
             continue
 
         words = entity['text'].split()
@@ -618,11 +517,11 @@ def extract_entities_with_attributes(
         entity_text = entity["text"]
         entity_type = entity["type"]
 
-        if entity_type == "ORG":
+        if entity_type == "ORGANIZATION":
             if any(pattern.search(entity_text) for pattern in compiled_ignore_orgs):
                 continue
 
-        if entity_type == "PER":
+        if entity_type == "PERSON":
             context_start = max(0, entity["start"] - 50)
             context_text = text[context_start:entity["start"]]
             if any(pattern.search(context_text) for pattern in compiled_ignore_persons):
@@ -630,7 +529,7 @@ def extract_entities_with_attributes(
             if ignore_initials and re.search(r'[А-ЯЁA-Z]\.[А-ЯЁA-Z]?\.?', entity_text):
                 continue
 
-        if entity_type == "ORG" and entity_text.upper() in ORG_FORMS:
+        if entity_type == "ORGANIZATION" and entity_text.upper() in ORG_FORMS:
             continue
 
         filtered_entities.append(entity)
@@ -642,7 +541,7 @@ def extract_entities_with_attributes(
     # ========================================================================
     clusters = {}
     for span in filtered_entities:
-        if span['type'] == 'PER':
+        if span['type'] == 'PERSON':
             words = span['text'].split()
             key_parts = [word[:3].lower() for word in words[:3]]
             key = "".join(key_parts)
@@ -665,21 +564,21 @@ def extract_entities_with_attributes(
     if not active_attributes:
         return [{
             'entity': span['text'],
-            'type': span['type'],
+            'type': 'PER' if span['type'] == 'PERSON' else 'ORG',
             'start': span['start'],
             'stop': span['stop'],
             'attributes': {},
         } for span in merged_spans]
 
     # ========================================================================
-    # ШАГ 4. ПОИСК АТРИБУТОВ (абсолютные координаты по входному тексту)
+    # ШАГ 4. ПОИСК АТРИБУТОВ (без изменений)
     # ========================================================================
     results = []
     used_accounts = set()
 
     for span_index, span in enumerate(merged_spans):
         entity_text = span['text']
-        entity_type = span['type']
+        entity_type = 'PER' if span['type'] == 'PERSON' else 'ORG'
 
         block_end = len(text) if span_index + 1 == len(merged_spans) else merged_spans[span_index + 1]['start']
         block_start = 0 if span_index == 0 else merged_spans[span_index - 1]['stop']
@@ -732,10 +631,8 @@ def extract_entities_with_attributes(
                 found_attributes[attribute_name] = matches[0] if matches else None
 
             elif attribute_name == "account":
-                # Область поиска — та же, что при поиске всех счетов
                 matches = _finditer_abs(regex, text, search_start, search_end)
 
-                # Фильтрация по банку — только если заданы owner/ignore
                 if compiled_account_owners or compiled_account_ignores:
                     matches = _select_accounts_by_bank(
                         text=text,

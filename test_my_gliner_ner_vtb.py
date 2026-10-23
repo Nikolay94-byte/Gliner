@@ -1,6 +1,5 @@
 import os
 import re
-import json
 from my_gliner_ner import (
     extract_entities_with_attributes,
     TOP_RUSSIAN_BANKS,
