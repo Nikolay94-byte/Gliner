@@ -1,8 +1,7 @@
 import os
 import re
-from my_gliner_ner import (
+from extract_entities_with_attributes_script.my_gliner_ner import (
     extract_entities_with_attributes,
-    TOP_RUSSIAN_BANKS,
 )
 
 TEXTS_DIR = r"F:\Python projects\Gliner\data\debtors_vtb_account_numbers"
@@ -72,6 +71,7 @@ IGNORE_ORG_PATTERNS = [
     r'втб', r'сбербанк', r'альфа-?банк', r'тбанк|т-банк|тинькофф',
     r'озон\s*банк', r'единая\s+касса', r'банк', r'касса', r'фонд',
     r'мвд', r'омвд', r'отдел', r'отделение', r'суд', r'прокуратур',
+    r'райффайзенбанк',r'област(и|ь)',r'РФ',r'Российской Федерации',r'налоговых органов',r'органов\W{,3}контроля'
 ]
 
 IGNORE_PERSON_PATTERNS = [

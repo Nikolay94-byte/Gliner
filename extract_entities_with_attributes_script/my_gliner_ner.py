@@ -523,7 +523,7 @@ def extract_entities_with_attributes(
 
         if entity_type == "PERSON":
             context_start = max(0, entity["start"] - 50)
-            context_text = text[context_start:entity["start"]]
+            context_text = text[context_start:entity["stop"]]  # ← включаем саму сущность
             if any(pattern.search(context_text) for pattern in compiled_ignore_persons):
                 continue
             if ignore_initials and re.search(r'[А-ЯЁA-Z]\.[А-ЯЁA-Z]?\.?', entity_text):
